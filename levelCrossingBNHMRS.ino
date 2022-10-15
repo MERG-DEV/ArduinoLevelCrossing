@@ -1,4 +1,4 @@
-#define GATE_SPEED        100 // [ms] lower number is higher servo speed
+#define GATE_SPEED         12 // [ms] lower number is higher servo speed
 #define GATE_DELAY       5000 // [ms] delay time before gate closes 
 #define GATE_OPEN_ANGLE    60 // servo angle
 #define GATE_CLOSED_ANGLE 135 // servo angle
@@ -14,17 +14,20 @@
 
 // IO Pins
 #define SOUNDER_PIN               2
-#define PUSHBUTTON_PIN            7
-#define PUSHBUTTON_LED_PIN        8
+#define PUSHBUTTON_PIN            3
+#define PUSHBUTTON_LED_PIN        4
 
-#define NUM_SERVOS                4
+#define NUM_SERVOS                2
 #define NUM_WIGWAG_PANELS         4
 
-static int servoPin[NUM_SERVOS] = {A0, A1, A2, A3};
-static int boomLedPin[NUM_SERVOS] = {A0, A1, A2, A3};
-static int yellowLedPin[NUM_WIGWAG_PANELS] = {A0, A1, A2, A3};
-static int Wigwag1LedPin[NUM_WIGWAG_PANELS] = {A0, A1, A2, A3};
-static int Wigwag2LedPin[NUM_WIGWAG_PANELS] = {A0, A1, A2, A3};
+static int servoLeftPin[NUM_SERVOS] = {A1, A3};
+static int servoRightPin[NUM_SERVOS] = {A0, A2};
+static boolean servoLeftInvert[NUM_SERVOS] = {false, true};
+static boolean servoRightInvert[NUM_SERVOS] = {false, true};
+
+static int yellowLedPin[NUM_WIGWAG_PANELS] = {5, 6, 7, 8};
+static int wigwag1LedPin[NUM_WIGWAG_PANELS] = {9, 10, 11, 12};
+static int wigwag2LedPin[NUM_WIGWAG_PANELS] = {A4, A5, A4, A5}; //A6 and A7 cannot do digital I/O
 
 
 enum e_states {
@@ -33,7 +36,9 @@ enum e_states {
               YELLOW,           // Yellow constant and sounder
               RED,              // Both Reds constant, Yellow constant and sounder
               RED_WIGWAGS,      // Yellow off, WigWags flashing and sounder
-              GATES_CLOSING,    // WigWags flashing, boom lights on and sounder
+              LEFT_GATES_CLOSING, // WigWags flashing, boom lights on and sounder
+              LEFT_GATES_CLOSED,  // WigWags flashing, boom lights on and sounder
+              RIGHT_GATES_CLOSING,// WigWags flashing, boom lights on and sounder
               GATES_CLOSED,     // WigWags flashing, boom lights on. No sounder.
               GATES_OPENING,    // Wigwags off, boom lights on. No sounder.
               POST_ACTION_DELAY // all off.
@@ -44,7 +49,8 @@ enum e_transitions {
               START_SEQUENCE, // after short delay after pressing button
               START_REDS,     // after yellow only
               START_WIGWAGS,  //
-              START_CLOSING,  //
+              START_LEFT_CLOSING,  //
+              START_RIGHT_CLOSING,  //
               FINISH_CLOSING, //
               START_OPENING,  //
               FINISH_OPENING, //
@@ -57,8 +63,10 @@ e_transitions current_transition = NO_TRANSITION;
 byte led1, led2;
 boolean wigwags_enabled = false;
 
-byte angle    = GATE_OPEN_ANGLE;
-byte setpoint = GATE_OPEN_ANGLE;
+float angleLeft = GATE_OPEN_ANGLE;
+float setpointLeft = GATE_OPEN_ANGLE;
+float angleRight = GATE_OPEN_ANGLE;
+float setpointRight = GATE_OPEN_ANGLE;
 
 unsigned long time_to_blink;
 unsigned long time_to_close_gate;
@@ -71,12 +79,15 @@ unsigned long time_for_red_wigwags;
 unsigned long time_for_train_to_pass;
 unsigned long time_for_post_operation_delay;
 
-boolean gates_closed;
-boolean gates_open;
+boolean gates_closed_left;
+boolean gates_open_left;
+boolean gates_closed_right;
+boolean gates_open_right;
 boolean alarm_sounding = false;
 
 #include <Servo.h>
-Servo gate_servos [NUM_SERVOS];
+Servo gate_left_servos [NUM_SERVOS];
+Servo gate_right_servos [NUM_SERVOS];
 
 // Sounder data
 // notes in the sounder melody:
@@ -94,22 +105,39 @@ unsigned long time_for_note;
 
 void setup() {
   pinMode(PUSHBUTTON_PIN, INPUT_PULLUP);
-  pinMode(WIGWAG_LED1_PIN, OUTPUT);
-  pinMode(WIGWAG_LED2_PIN, OUTPUT);
-  pinMode(YELLOW_LED_PIN, OUTPUT);
-  pinMode(BOOM_LED_PIN, OUTPUT);
   pinMode(PUSHBUTTON_LED_PIN, OUTPUT);
   pinMode(SOUNDER_PIN, OUTPUT);
 
-  for (byte s = 0; s < NUM_SERVOS; s++){
-    gate_servos[s].attach(servoPin[s]);
-    gate_servos[s].write(angle);
-    delay(50);
-    gate_servos[s].detach();
+  for (byte s = 0; s < NUM_WIGWAG_PANELS; s++){
+    pinMode(yellowLedPin[s], OUTPUT);
+    pinMode(wigwag1LedPin[s], OUTPUT);
+    pinMode(wigwag2LedPin[s], OUTPUT);
   }
 
-  gates_closed = false;
-  gates_open = true;
+  for (byte s = 0; s < NUM_SERVOS; s++){
+    gate_left_servos[s].attach(servoLeftPin[s]);
+    gate_right_servos[s].attach(servoRightPin[s]);
+    if (servoLeftInvert[s]) {
+      gate_left_servos[s].write(GATE_CLOSED_ANGLE-(angleLeft-GATE_OPEN_ANGLE));
+    }
+    else {
+      gate_left_servos[s].write(angleLeft);
+    }
+    if (servoRightInvert[s]) {
+      gate_right_servos[s].write(GATE_CLOSED_ANGLE-(angleRight-GATE_OPEN_ANGLE));
+    }
+    else {
+      gate_right_servos[s].write(angleRight);
+    }
+    delay(50);
+    gate_left_servos[s].detach();
+    gate_right_servos[s].detach();
+  }
+
+  gates_closed_left = false;
+  gates_open_left = true;
+  gates_closed_right = false;
+  gates_open_right = true;
   alarm_sounding = false;
 
   digitalWrite(PUSHBUTTON_LED_PIN, HIGH);
@@ -156,13 +184,20 @@ void loop() {
 
     case RED_WIGWAGS: // Red wig-wags
       if (millis() > time_for_red_wigwags) {
-        current_transition = START_CLOSING;
-        Serial.println("starting closing gates.");
+        current_transition = START_LEFT_CLOSING;
+        Serial.println("starting closing left gates.");
       }
     break;
 
-    case GATES_CLOSING: // Red wig-wags and servos moving
-      if (gates_closed) {
+    case LEFT_GATES_CLOSING: // Red wig-wags and servos moving
+      if (gates_closed_left) {
+        current_transition = START_RIGHT_CLOSING;
+        Serial.println("finished closing gates.");
+      }
+    break;
+
+    case RIGHT_GATES_CLOSING: // Red wig-wags and servos moving
+      if (gates_closed_right) {
         current_transition = FINISH_CLOSING;
         Serial.println("finished closing gates.");
       }
@@ -176,7 +211,7 @@ void loop() {
     break;
 
     case GATES_OPENING: // Red wig-wags and servos moving
-      if (gates_open) {
+      if (gates_open_left) {
         current_transition = FINISH_OPENING;
         Serial.println("finished opening gates.");
       }
@@ -202,7 +237,9 @@ void loop() {
   
     case START_SEQUENCE: //
       Serial.println("Time to start the sequence. Yellow only");
-      digitalWrite(YELLOW_LED_PIN, HIGH);
+      for (byte s = 0; s < NUM_WIGWAG_PANELS; s++){
+        digitalWrite(yellowLedPin[s], HIGH);
+      }
       time_for_yellow = millis() + (unsigned long)YELLOW_ONLY_TIME;
       current_note = 1;
       time_for_note = millis() + (unsigned long)noteDurations[current_note-1];
@@ -214,9 +251,10 @@ void loop() {
 
     case START_REDS: //
       Serial.println("Time to start the sequence, Yellow and both Reds");
-      digitalWrite(WIGWAG_LED1_PIN, HIGH);
-      digitalWrite(WIGWAG_LED2_PIN, HIGH);
-      digitalWrite(BOOM_LED_PIN, HIGH);
+      for (byte s = 0; s < NUM_WIGWAG_PANELS; s++){
+        digitalWrite(wigwag1LedPin[s], HIGH);
+        digitalWrite(wigwag2LedPin[s], HIGH);
+      }
       time_for_reds_and_yellow = millis() + (unsigned long)RED_YELLOW_TIME;
       current_transition = NO_TRANSITION;
       current_state = RED;
@@ -224,36 +262,54 @@ void loop() {
 
     case START_WIGWAGS: //
       Serial.println("Time to start the Wig-Wags, Yellow off");
-      digitalWrite(YELLOW_LED_PIN, LOW);
+      for (byte s = 0; s < NUM_WIGWAG_PANELS; s++){
+        digitalWrite(yellowLedPin[s], LOW);
+      }
       wigwags_enabled = true;
       time_to_blink = millis() + (unsigned long)BLINK_SPEED;
       led1 = LOW;
       led2 = !led1;
-      digitalWrite(WIGWAG_LED1_PIN, led1);
-      digitalWrite(WIGWAG_LED2_PIN, led2);
+      for (byte s = 0; s < NUM_WIGWAG_PANELS; s++){
+        digitalWrite(wigwag1LedPin[s], led1);
+        digitalWrite(wigwag2LedPin[s], led2);
+      }
       time_for_red_wigwags = millis() + (unsigned long)WIGWAG_TIME;
       current_transition = NO_TRANSITION;
       current_state = RED_WIGWAGS;
     break;
 
-    case START_CLOSING: //
+    case START_LEFT_CLOSING: //
       Serial.println("Time to start closing the gates");
 
       for (byte s = 0; s < NUM_SERVOS; s++){
-        gate_servos[s].attach(servoPin[s]);
+        gate_left_servos[s].attach(servoLeftPin[s]);
       }
 
-      gates_open = false;
+      gates_open_left = false;
       time_for_servo = millis() + (unsigned long)GATE_SPEED;
-      setpoint = GATE_CLOSED_ANGLE;
+      setpointLeft = GATE_CLOSED_ANGLE;
       current_transition = NO_TRANSITION;
-      current_state = GATES_CLOSING;
+      current_state = LEFT_GATES_CLOSING;
+    break;
+
+    case START_RIGHT_CLOSING: //
+      Serial.println("Time to start closing the gates");
+
+      for (byte s = 0; s < NUM_SERVOS; s++){
+        gate_right_servos[s].attach(servoRightPin[s]);
+      }
+
+      gates_open_right = false;
+      time_for_servo = millis() + (unsigned long)GATE_SPEED;
+      setpointRight = GATE_CLOSED_ANGLE;
+      current_transition = NO_TRANSITION;
+      current_state = RIGHT_GATES_CLOSING;
     break;
 
     case FINISH_CLOSING: //
       Serial.println("Gates closed, wait for train");
       for (byte s = 0; s < NUM_SERVOS; s++){
-        gate_servos[s].detach();
+        gate_left_servos[s].detach();
       }
       time_for_train_to_pass = millis() + (unsigned long)TRAIN_PASSING_TIME;
       current_transition = NO_TRANSITION;
@@ -263,11 +319,14 @@ void loop() {
     case START_OPENING: //
       Serial.println("Time to start opening the gates");
       for (byte s = 0; s < NUM_SERVOS; s++){
-        gate_servos[s].attach(servoPin[s]);
+        gate_left_servos[s].attach(servoLeftPin[s]);
+        gate_right_servos[s].attach(servoRightPin[s]);
       }
-      gates_closed = false;
+      gates_closed_left = false;
+      gates_closed_right = false;
       time_for_servo = millis() + (unsigned long)GATE_SPEED;
-      setpoint = GATE_OPEN_ANGLE;
+      setpointLeft = GATE_OPEN_ANGLE;
+      setpointRight = GATE_OPEN_ANGLE;
       current_transition = NO_TRANSITION;
       current_state = GATES_OPENING;
     break;
@@ -275,11 +334,13 @@ void loop() {
     case FINISH_OPENING: //
       Serial.println("Gates opened");
       for (byte s = 0; s < NUM_SERVOS; s++){
-        gate_servos[s].detach();
+        gate_left_servos[s].detach();
+        gate_right_servos[s].detach();
       }
-      digitalWrite(WIGWAG_LED1_PIN, LOW);
-      digitalWrite(WIGWAG_LED2_PIN, LOW);
-      digitalWrite(BOOM_LED_PIN, LOW);
+      for (byte s = 0; s < NUM_WIGWAG_PANELS; s++){
+        digitalWrite(wigwag1LedPin[s], LOW);
+        digitalWrite(wigwag2LedPin[s], LOW);
+      }
       wigwags_enabled = false;
       alarm_sounding = false;
       noTone(SOUNDER_PIN);
@@ -299,20 +360,50 @@ void loop() {
 
   // Other processes
 
-  if (not gates_open and not gates_closed and millis() > time_for_servo) {
-    time_for_servo = millis() + (unsigned long)GATE_SPEED;
-    if (angle < setpoint) angle++;
-    if (angle > setpoint) angle--;
-    // Serial.println((String)"Move Servos to " + angle);
-    for (byte s = 0; s < NUM_SERVOS; s++){
-      gate_servos[s].write(angle);
+  if (not gates_open_left and not gates_closed_left and millis() > time_for_servo) {
+    if (gates_open_right or gates_closed_right) {
+      time_for_servo = millis() + (unsigned long)GATE_SPEED;
     }
-    if (angle == setpoint) {
-      if (setpoint == GATE_OPEN_ANGLE) {
-        gates_open = true;
+    if (angleLeft < setpointLeft) angleLeft = angleLeft + 0.125;
+    if (angleLeft > setpointLeft) angleLeft = angleLeft - 0.125;
+    // Serial.println((String)"Move Servos to " + angleLeft);
+    for (byte s = 0; s < NUM_SERVOS; s++){
+      if (servoLeftInvert[s]){
+        gate_left_servos[s].write(GATE_CLOSED_ANGLE-(angleLeft-GATE_OPEN_ANGLE));
       }
       else {
-        gates_closed = true;
+        gate_left_servos[s].write(angleLeft);
+      }
+    }
+    if (angleLeft == setpointLeft) {
+      if (setpointLeft == GATE_OPEN_ANGLE) {
+        gates_open_left = true;
+      }
+      else {
+        gates_closed_left = true;
+      }
+    }
+  }
+
+  if (not gates_open_right and not gates_closed_right and millis() > time_for_servo) {
+    time_for_servo = millis() + (unsigned long)GATE_SPEED;
+    if (angleRight < setpointRight) angleRight = angleRight + 0.125;
+    if (angleRight > setpointRight) angleRight = angleRight - 0.125;
+    // Serial.println((String)"Move Servos to " + angle);
+    for (byte s = 0; s < NUM_SERVOS; s++){
+      if (servoRightInvert[s]){
+        gate_right_servos[s].write(GATE_CLOSED_ANGLE-(angleRight-GATE_OPEN_ANGLE));
+      }
+      else {
+        gate_right_servos[s].write(angleRight);
+      }
+    }
+    if (angleRight == setpointRight) {
+      if (setpointRight == GATE_OPEN_ANGLE) {
+        gates_open_right = true;
+      }
+      else {
+        gates_closed_right = true;
       }
     }
   }
@@ -322,8 +413,10 @@ void loop() {
     time_to_blink = millis() + (unsigned long)BLINK_SPEED;
     led1 = !led1;
     led2 = !led1;
-    digitalWrite(WIGWAG_LED1_PIN, led1);
-    digitalWrite(WIGWAG_LED2_PIN, led2);
+    for (byte s = 0; s < NUM_WIGWAG_PANELS; s++){
+      digitalWrite(wigwag1LedPin[s], led1);
+      digitalWrite(wigwag2LedPin[s], led2);
+    }
   }
 
   if (alarm_sounding and millis() > time_for_note) {
